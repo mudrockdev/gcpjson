@@ -98,7 +98,7 @@ async function processLogs() {
       dirFiles.sort().forEach((file) => console.log(`  └─ ${file}`));
     }
 
-    console.log(`\nTotal files found: ${files.length}`);
+    console.log(`\nTotal files in bucket: ${files.length}`);
 
     // Now process only today's JSON files
     console.log("\nStarting JSON processing...");
@@ -132,7 +132,7 @@ async function processLogs() {
     console.log(`Processing ${jsonFiles.length} JSON files from today...`);
 
     // Process and combine all files
-    const combinedData = [];
+    const writeStream = fs.createWriteStream(TODAY_FILE, { flags: "w" });
     for (const { file, name } of jsonFiles) {
       try {
         // Download file contents
@@ -147,7 +147,9 @@ async function processLogs() {
         // Parse JSON content
         const jsonData = parseJsonContent(rawText);
         if (jsonData.length > 0) {
-          combinedData.push(...jsonData);
+          for (const jsonObject of jsonData) {
+            writeStream.write(`${JSON.stringify(jsonObject)}\n`);
+          }
           console.log(`✓ Processed ${name} (${jsonData.length} entries)`);
         } else {
           console.warn(`! No valid JSON entries found in ${name}`);
@@ -157,12 +159,10 @@ async function processLogs() {
       }
     }
 
-    // Write the combined JSON to file
-    fs.writeFileSync(TODAY_FILE, JSON.stringify(combinedData, null, 2));
+    writeStream.end();
 
     console.log(`\nProcessing completed:`);
     console.log(`- ${jsonFiles.length} files processed`);
-    console.log(`- ${combinedData.length} total records`);
     console.log(`- Output saved to: ${TODAY_FILE}`);
   } catch (error) {
     console.error("Error processing files:", error);
