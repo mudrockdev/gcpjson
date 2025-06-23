@@ -10,6 +10,7 @@ const storage = new Storage({
 const BUCKET_NAME = Bun.env.BUCKET_NAME;
 if (!BUCKET_NAME) throw new Error("BUCKET_NAME is not defined");
 const OUTPUT_FOLDER = path.resolve(__dirname, "./data");
+const TODAY_FILE = path.join(OUTPUT_FOLDER, "today.json");
 
 // Ensure output directory exists
 if (!fs.existsSync(OUTPUT_FOLDER)) {
@@ -20,121 +21,149 @@ interface FileWithDate {
   file: any;
   created: Date;
   name: string;
+  size: number;
 }
 
-// Get the latest processed file information
-function getLatestProcessedFile(): { date: Date; sequence: number } | null {
-  const files = fs.readdirSync(OUTPUT_FOLDER);
-  let latestDate: Date | null = null;
-  let latestSequence = -1;
-
-  files.forEach((file) => {
-    if (!file.endsWith(".json")) return;
-
-    // Parse date from filename (DD-MM-YYYY-Sn.json)
-    const match = file.match(/(\d{2})-(\d{2})-(\d{4})-S(\d+)\.json/);
-    if (!match) return;
-
-    const [_, day, month, year, sequence] = match;
-    const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
-    const seq = parseInt(sequence);
-
-    if (!latestDate || date > latestDate) {
-      latestDate = date;
-      latestSequence = seq;
-    } else if (
-      date.getTime() === latestDate.getTime() &&
-      seq > latestSequence
-    ) {
-      latestSequence = seq;
-    }
-  });
-
-  return latestDate ? { date: latestDate, sequence: latestSequence } : null;
+// Format date as YYYY/MM/DD for path matching
+function formatDatePath(date: Date): string {
+  return `${date.getUTCFullYear()}/${(date.getUTCMonth() + 1)
+    .toString()
+    .padStart(2, "0")}/${date.getUTCDate().toString().padStart(2, "0")}`;
 }
 
-// Format date as DD-MM-YYYY
-function formatDate(date: Date): string {
-  return `${date.getDate().toString().padStart(2, "0")}-${(date.getMonth() + 1).toString().padStart(2, "0")}-${date.getFullYear()}`;
+// Check if a path contains today's date
+function isFromToday(filePath: string): boolean {
+  const today = new Date();
+  const todayPath = formatDatePath(today);
+  return filePath.includes(todayPath);
 }
 
-async function downloadAndSaveJSON() {
+// Parse JSON content that might be either JSON Lines or regular JSON
+function parseJsonContent(content: string): any[] {
+  const trimmedContent = content.trim();
+  if (!trimmedContent) return [];
+
+  // Try parsing as a single JSON first
   try {
-    // Get latest processed file info
-    const lastProcessed = getLatestProcessedFile();
-    console.log(
-      "Last processed file:",
-      lastProcessed
-        ? `Date: ${formatDate(lastProcessed.date)}, Sequence: S${lastProcessed.sequence}`
-        : "No processed files found",
-    );
+    const parsed = JSON.parse(trimmedContent);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch (e) {
+    // If that fails, try parsing as JSON Lines
+    const results = [];
+    const lines = trimmedContent.split("\n");
 
-    // Get all JSON files from bucket
-    const [files] = await storage.bucket(BUCKET_NAME).getFiles();
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
 
-    // Filter and map JSON files with their creation date
+      try {
+        results.push(JSON.parse(trimmedLine));
+      } catch (err) {
+        console.warn(
+          `Failed to parse JSON line: ${trimmedLine.substring(0, 100)}...`,
+        );
+      }
+    }
+
+    return results;
+  }
+}
+
+async function processLogs() {
+  try {
+    const today = new Date();
+    const todayPath = formatDatePath(today);
+    console.log(`Processing files for today's date: ${todayPath}`);
+
+    // Get all files from bucket recursively
+    const [files] = await storage.bucket(BUCKET_NAME).getFiles({
+      autoPaginate: true,
+    });
+
+    // First, display directory structure
+    console.log(`\nBucket structure for: ${BUCKET_NAME}`);
+    const filesByDirectory = new Map<string, string[]>();
+
+    for (const file of files) {
+      const dirPath = path.dirname(file.name);
+      if (!filesByDirectory.has(dirPath)) {
+        filesByDirectory.set(dirPath, []);
+      }
+      filesByDirectory.get(dirPath)?.push(path.basename(file.name));
+    }
+
+    // Print directory structure
+    for (const [dir, dirFiles] of filesByDirectory) {
+      console.log(`\n${dir}/`);
+      dirFiles.sort().forEach((file) => console.log(`  └─ ${file}`));
+    }
+
+    console.log(`\nTotal files found: ${files.length}`);
+
+    // Now process only today's JSON files
+    console.log("\nStarting JSON processing...");
+
+    // Filter for today's JSON files only
     const jsonFiles: FileWithDate[] = [];
 
     for (const file of files) {
-      if (!file.name.endsWith(".json")) continue;
+      // Only process JSON files from today
+      if (!file.name.endsWith(".json") || !isFromToday(file.name)) continue;
 
       const [metadata] = await file.getMetadata();
       const created = new Date(metadata.timeCreated);
-
-      // Only include files newer than the last processed file
-      if (lastProcessed && created <= lastProcessed.date) continue;
 
       jsonFiles.push({
         file,
         created,
         name: file.name,
+        size: parseInt(metadata.size),
       });
+    }
+
+    if (jsonFiles.length === 0) {
+      console.log(`No JSON files found for today (${todayPath})`);
+      return;
     }
 
     // Sort files by creation date
     jsonFiles.sort((a, b) => a.created.getTime() - b.created.getTime());
 
-    // Group files by date
-    const filesByDate = new Map<string, FileWithDate[]>();
+    console.log(`Processing ${jsonFiles.length} JSON files from today...`);
 
-    jsonFiles.forEach((fileData) => {
-      const dateStr = formatDate(fileData.created);
-      if (!filesByDate.has(dateStr)) {
-        filesByDate.set(dateStr, []);
-      }
-      filesByDate.get(dateStr)?.push(fileData);
-    });
+    // Process and combine all files
+    const combinedData = [];
+    for (const { file, name } of jsonFiles) {
+      try {
+        // Download file contents
+        const [contents] = await file.download();
+        const rawText = contents.toString();
 
-    // Process each date's files
-    for (const [dateStr, dateFiles] of filesByDate) {
-      console.log(`Processing files for date: ${dateStr}`);
-
-      for (let i = 0; i < dateFiles.length; i++) {
-        const { file, name } = dateFiles[i];
-
-        try {
-          // Download file contents
-          const [contents] = await file.download();
-          const rawText = contents.toString().trim();
-
-          if (!rawText) {
-            console.warn(`Empty file skipped: ${name}`);
-            continue;
-          }
-
-          // Save JSON file with incremental sequence number
-          const filename = `${dateStr}-S${i}.json`;
-          const outputPath = path.join(OUTPUT_FOLDER, filename);
-          fs.writeFileSync(outputPath, rawText);
-
-          console.log(`Processed ${name} -> ${filename}`);
-        } catch (err) {
-          console.error(`Error processing file ${name}:`, err);
+        if (!rawText.trim()) {
+          console.warn(`Empty file skipped: ${name}`);
+          continue;
         }
+
+        // Parse JSON content
+        const jsonData = parseJsonContent(rawText);
+        if (jsonData.length > 0) {
+          combinedData.push(...jsonData);
+          console.log(`✓ Processed ${name} (${jsonData.length} entries)`);
+        } else {
+          console.warn(`! No valid JSON entries found in ${name}`);
+        }
+      } catch (err) {
+        console.error(`✗ Error processing file ${name}:`, err);
       }
     }
 
-    console.log("Processing completed");
+    // Write the combined JSON to file
+    fs.writeFileSync(TODAY_FILE, JSON.stringify(combinedData, null, 2));
+
+    console.log(`\nProcessing completed:`);
+    console.log(`- ${jsonFiles.length} files processed`);
+    console.log(`- ${combinedData.length} total records`);
+    console.log(`- Output saved to: ${TODAY_FILE}`);
   } catch (error) {
     console.error("Error processing files:", error);
     throw error;
@@ -142,4 +171,4 @@ async function downloadAndSaveJSON() {
 }
 
 // Execute the process
-downloadAndSaveJSON().catch(console.error);
+processLogs().catch(console.error);
